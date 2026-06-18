@@ -80,10 +80,10 @@ CP_DIST_KM = {
     "South Harting":       43.4,
     "Cocking":             57.4,
     "Houghton Farm":       72.0,
-    "Washington":          85.3,   # ← roughly halfway (53 miles)
+    "Washington":          85.3,   # ← roughly halfway (53 miles), 1st major crew checkpoint; long dwell times expected
     "Botolphs":            97.2,
     "Saddlescombe Farm":  107.5,
-    "Housedean Farm":     121.0,   # ← major crew checkpoint; long dwell times expected
+    "Housedean Farm":     121.0,   # ← 2nd major crew checkpoint; long dwell times expected
     "Southease":          126.4,
     "Alfriston":          138.2,
     "Jevington":          149.4,
