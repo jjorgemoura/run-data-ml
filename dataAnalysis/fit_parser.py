@@ -53,7 +53,6 @@ activity = fitparse.FitFile(FIT_FILE)
 
 print(f"FIT Protocol Version: {activity.protocol_version}")
 print(f"FIT Profile Version: {activity.profile_version}")
-# print(f"FIT Protocol Messages: {activity.messages}")
 
 
 # CONCEPT: get_messages() — reading data from the file
@@ -247,6 +246,7 @@ def parse_session(activity):
             "max_hr":      session.get_value("max_heart_rate"),
             "total_ascent":session.get_value("total_ascent"),
         }
+    raise ValueError(f"No session message found — file may be corrupt or incomplete")
 
 
 # ── Function 2: parse all data points from a FIT file ────────────────────────
@@ -676,7 +676,7 @@ for name, df in dfs.items():
         df["distance_km"],
         smooth,
         label=name,
-        color=RACE_COLOURS[name],
+        color=RACE_COLOURS.get(name, "slategray"),
         linewidth=1.0,
         alpha=0.85,
     )
@@ -979,8 +979,9 @@ X2_test_sc  = scaler2.transform(X2_test)
 
 lr2 = LinearRegression()
 lr2.fit(X2_train_sc, y2_train)
-lr2_mae = mean_absolute_error(y2_test, lr2.predict(X2_test_sc))
-lr2_r2  = r2_score(y2_test, lr2.predict(X2_test_sc))
+lr2_pred = lr2.predict(X2_test_sc)
+lr2_mae  = mean_absolute_error(y2_test, lr2_pred)
+lr2_r2   = r2_score(y2_test, lr2_pred)
 
 
 # ── Random Forest ──────────────────────────────────────────────────────────────
@@ -1047,8 +1048,10 @@ print(f"  {'Random Forest, 4 features':<32}  {rf_mae:>12.2f}  {rf_r2:>8.3f}")
 sdw25_feat = add_features(dfs["SDW100 2025"])[FEATURES_V2 + [TARGET]].dropna()
 sdw26_feat = add_features(dfs["SDW100 2026"])[FEATURES_V2 + [TARGET]].dropna()
 
-X_25 = sdw25_feat[FEATURES_V2];  y_25 = sdw25_feat[TARGET]
-X_26 = sdw26_feat[FEATURES_V2];  y_26 = sdw26_feat[TARGET]
+X_25 = sdw25_feat[FEATURES_V2]
+y_25 = sdw25_feat[TARGET]
+X_26 = sdw26_feat[FEATURES_V2]
+y_26 = sdw26_feat[TARGET]
 
 scaler_cv  = StandardScaler()
 X_25_sc    = scaler_cv.fit_transform(X_25)   # fit on 2025 only
@@ -1138,8 +1141,239 @@ plt.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# STEP 8 — External data: predicting SDW100 finish time from checkpoint splits
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Steps 6 and 7 worked on GPS data with 100k+ rows per race — one row per
+# second. Consecutive rows are nearly identical, so a random train/test split
+# was not honest (neighbours bled between sets).
+#
+# Here we have the full SDW100 2026 results: 500 runners, one row each.
+# Each row is fully independent of the others — a random split is correct.
+#
+# Problem: given a runner's elapsed time at the first four checkpoints
+# (~34 miles / 55 km into the race), can we predict their finishing time?
+# This is exactly what pacers and crews estimate at aid stations.
+#
+# New concepts: pd.read_excel, pd.to_datetime, pd.to_timedelta,
+#               pd.get_dummies (one-hot encoding), dropna(subset=[...]).
+
+print("\n── Step 8: Finish Time Prediction from Checkpoint Splits ────────────")
+
+
+# ── Load the race results ──────────────────────────────────────────────────────
+#
+# CONCEPT: pd.read_excel(path, header=N)
+# Reads an Excel .xlsx file into a DataFrame.
+# header=1 skips the first row (the race title) and uses the second row
+# as column names.
+
+RESULTS_FILE = "../dataSources/racesResults/CenturionSDW100_2026.xlsx"
+results_raw  = pd.read_excel(RESULTS_FILE, header=1)
+
+# CONCEPT: dropna(subset=[...])
+# Drops rows where ANY of the listed columns is NaN.
+# DNFs have no Overall position, so this keeps only finishers.
+finishers = results_raw.dropna(subset=["Overall"]).copy()
+
+print(f"\n  Total entries : {len(results_raw)}")
+print(f"  Finishers     : {len(finishers)}")
+print(f"  DNFs          : {len(results_raw) - len(finishers)}")
+
+
+# ── Parse datetimes and finish time ───────────────────────────────────────────
+#
+# CONCEPT: pd.to_datetime()
+# Converts a string like "2026-06-13 06:57:48" to a datetime object so we
+# can do date arithmetic — subtracting two datetimes gives a timedelta.
+#
+# CONCEPT: pd.to_timedelta() + .dt.total_seconds()
+# "13:27:13" is a duration, not a clock time — to_timedelta() parses it.
+# .dt.total_seconds() then converts the timedelta to a plain float (seconds).
+
+CP_COLS = ["Start", "Beacon Hill Beeches", "QECP", "South Harting", "Cocking"]
+for col in CP_COLS:
+    finishers[col] = pd.to_datetime(finishers[col])
+
+finishers["finish_hours"] = (
+    pd.to_timedelta(finishers["Time"])
+    .dt.total_seconds() / 3600
+)
+
+
+# ── Feature engineering: elapsed time to each checkpoint ─────────────────────
+#
+# Each runner's Start timestamp differs (two waves: 05:30 and 06:30).
+# Subtracting Start from the checkpoint time gives elapsed hours for everyone
+# on the same scale.
+
+CHECKPOINT_MAP = {
+    "split_cp1": "Beacon Hill Beeches",   # ~24 km / 15 miles
+    "split_cp2": "QECP",                  # ~37 km / 23 miles
+    "split_cp3": "South Harting",         # ~48 km / 30 miles
+    "split_cp4": "Cocking",               # ~55 km / 34 miles
+}
+
+for feat, col in CHECKPOINT_MAP.items():
+    finishers[feat] = (
+        (finishers[col] - finishers["Start"]).dt.total_seconds() / 3600
+    )
+
+
+# ── Encode categorical features ───────────────────────────────────────────────
+#
+# CONCEPT: pd.get_dummies(series, prefix=, drop_first=True)
+# ML models only understand numbers, not strings like "Male" or "Female".
+# get_dummies creates one binary (0/1) column per category value.
+# This is called one-hot encoding.
+#
+# CONCEPT: drop_first=True — avoiding the dummy variable trap
+# Gender has three values here: Male, Female, Non Binary.
+# Alphabetically Female comes first, so drop_first removes it.
+# Result: gender_Male=1 → Male,  gender_Non Binary=1 → Non Binary,
+#         both 0 → Female.  Two columns encode three categories perfectly.
+# Adding gender_Female on top would be redundant (the three always sum to 1),
+# which confuses linear regression. drop_first removes the redundant one.
+
+gender_dummies = pd.get_dummies(finishers["Gender"], prefix="gender", drop_first=True)
+
+# Collapse the 10 age groups into 4 cleaner categories.
+finishers["age_cat"] = finishers["Group"].apply(
+    lambda g: "Open"    if g in ("M", "F", "XV40") else
+              "V40"     if "40" in g else
+              "V50"     if "50" in g else "V60plus"
+)
+age_dummies = pd.get_dummies(finishers["age_cat"], prefix="age", drop_first=True)
+
+# Attach the dummy columns to the table (they share the same row index).
+finishers = pd.concat([finishers, gender_dummies, age_dummies], axis=1)
+
+
+# ── Build the model-ready DataFrame ───────────────────────────────────────────
+
+SPLIT_FEATS = list(CHECKPOINT_MAP.keys())
+CAT_FEATS   = list(gender_dummies.columns) + list(age_dummies.columns)
+FEATURES_V3 = SPLIT_FEATS + CAT_FEATS
+TARGET_V3   = "finish_hours"
+
+ml_results = finishers[FEATURES_V3 + [TARGET_V3]].dropna()
+
+print(f"\n  Runners with complete data: {len(ml_results)}")
+print(f"  Features: {FEATURES_V3}")
+
+desc = ml_results[TARGET_V3].describe()
+print(f"\n  Finish time — min: {desc['min']:.2f}h  mean: {desc['mean']:.2f}h  max: {desc['max']:.2f}h")
+
+X3 = ml_results[FEATURES_V3]
+y3 = ml_results[TARGET_V3]
+
+
+# ── Train / test split ────────────────────────────────────────────────────────
+#
+# Each row is one independent runner — no temporal autocorrelation.
+# A random split is honest here.
+
+X3_train, X3_test, y3_train, y3_test = train_test_split(
+    X3, y3, test_size=0.2, random_state=42
+)
+
+scaler3     = StandardScaler()
+X3_train_sc = scaler3.fit_transform(X3_train)
+X3_test_sc  = scaler3.transform(X3_test)
+
+
+# ── Linear Regression ─────────────────────────────────────────────────────────
+
+lr3      = LinearRegression()
+lr3.fit(X3_train_sc, y3_train)
+lr3_pred = lr3.predict(X3_test_sc)
+lr3_mae  = mean_absolute_error(y3_test, lr3_pred)
+lr3_r2   = r2_score(y3_test, lr3_pred)
+
+
+# ── Random Forest ─────────────────────────────────────────────────────────────
+
+rf3      = RandomForestRegressor(n_estimators=100, n_jobs=-1, random_state=42)
+rf3.fit(X3_train_sc, y3_train)
+rf3_pred = rf3.predict(X3_test_sc)
+rf3_mae  = mean_absolute_error(y3_test, rf3_pred)
+rf3_r2   = r2_score(y3_test, rf3_pred)
+
+
+def h_to_hm(h):
+    """Convert a fractional hour float to a readable 'Xh YYm' string."""
+    return f"{int(h)}h {int((h % 1) * 60):02d}m"
+
+
+print(f"\n  {'Model':<22}  {'MAE':>10}  {'R²':>8}")
+print(f"  {'-'*44}")
+print(f"  {'Linear Regression':<22}  {h_to_hm(lr3_mae):>10}  {lr3_r2:>8.3f}")
+print(f"  {'Random Forest':<22}  {h_to_hm(rf3_mae):>10}  {rf3_r2:>8.3f}")
+
+
+# ── Visualise ─────────────────────────────────────────────────────────────────
+
+fig, (ax_scatter, ax_imp) = plt.subplots(ncols=2, figsize=(14, 6))
+fig.suptitle("Step 8: SDW100 2026 — Finish Time Prediction", fontsize=14)
+
+# Actual vs predicted for the test set, coloured by gender.
+# With 71 test runners, every data point is readable — unlike the 5000-sample
+# GPS charts from Steps 6 and 7.
+#
+# We derive gender masks from the one-hot columns so each category gets its
+# own colour. Female = both dummy columns are 0.
+test_idx = y3_test.index
+test_male = ml_results.loc[test_idx, "gender_Male"].values
+test_nb   = ml_results.loc[test_idx, "gender_Non Binary"].values if "gender_Non Binary" in ml_results.columns else (test_male * 0)
+
+gender_series = [
+    (test_male == 1,                                  "steelblue",  "Male"),
+    ((test_male == 0) & (test_nb == 0),               "crimson",    "Female"),
+    (test_nb == 1,                                    "darkorange", "Non Binary"),
+]
+for mask, colour, label in gender_series:
+    if mask.any():
+        ax_scatter.scatter(
+            y3_test.values[mask],
+            rf3_pred[mask],
+            alpha=0.75, s=50, color=colour, label=label,
+        )
+
+lims = [y3_test.min() - 0.5, y3_test.max() + 0.5]
+ax_scatter.plot(lims, lims, color="black", linewidth=1.0, linestyle="--", label="perfect prediction")
+ax_scatter.set_xlabel("Actual finish time (hours)")
+ax_scatter.set_ylabel("Predicted finish time (hours)")
+ax_scatter.set_title(
+    f"Test set  (MAE = {h_to_hm(rf3_mae)},  R² = {rf3_r2:.3f})",
+    loc="left", fontsize=10,
+)
+ax_scatter.legend()
+
+# Feature importance
+imp3       = rf3.feature_importances_
+sorted_idx = imp3.argsort()
+# Clean up feature labels for the chart
+feat_labels = [f.replace("split_cp", "CP ").replace("gender_Male", "gender\n(male)")
+                .replace("age_", "age ") for f in FEATURES_V3]
+
+ax_imp.barh(
+    [feat_labels[i] for i in sorted_idx],
+    imp3[sorted_idx],
+    color="steelblue",
+)
+ax_imp.set_xlabel("Importance (fraction of total)")
+ax_imp.set_title("What predicts finish time?", loc="left", fontsize=10)
+
+plt.tight_layout()
+out_path = OUTPUT_DIR / "step8_finish_prediction.png"
+plt.savefig(out_path, dpi=150)
+print(f"\n  Saved: {out_path}")
+plt.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # WHAT'S NEXT
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 8 will bring in external data: Centurion SDW100 2026 results
-# (all finishers, not just Jorge) to build a multi-runner finishing-time
-# predictor — the first model that generalises beyond a single athlete.
+# Step 9: cross-race generalisation — train on SDW100 2025 historical results
+# and test on SDW100 2026, asking whether a model built from one year's field
+# can predict the next year's finishing times.
