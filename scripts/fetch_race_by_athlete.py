@@ -12,10 +12,12 @@ def main():
     duv = DUVService()
     sdw100_event = duv.find_event_by_name(event_name)
     
-    asdasd = duv.fetch_all_athletes_of_event(111)
+    athletes = duv.fetch_all_athletes_of_event(111)
     
     races = duv.fetch_races_from_athlete(123)
 
+    xpto = duv.fetch_all_events()
+    print(f"JM: XXXXX = {xpto}")
 
     for race in races:
         # print(f"Athlete {athlete_name} ran: {race.title}, {race.year}, {race.finishTime}")
